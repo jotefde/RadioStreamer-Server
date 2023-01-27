@@ -127,6 +127,7 @@ void Server::AudioEmiter()
 {
 	Client* client;
 	vector<char> audioPackage(_packageSize);
+	vector<char> buffer(_packageSize);
 	int sentBytes = 0;
 
 	while (true)
@@ -171,12 +172,13 @@ void Server::AudioEmiter()
 			if (client->JoinedStream())
 			{
 				sentBytes = 0;
+				buffer = vector<char>(audioPackage);
 				client->LockWriting();
-				while (!audioPackage.empty())
+				while (!buffer.empty())
 				{
-					sentBytes = send(client->GetFD(), &audioPackage[0], 1024, 0);
+					sentBytes = send(client->GetFD(), &buffer[0], 1024, 0);
 					if (sentBytes > 0)
-						audioPackage.erase(audioPackage.begin(), audioPackage.begin() + sentBytes);
+						buffer.erase(buffer.begin(), buffer.begin() + sentBytes);
 					//usleep(100);
 				}
 				client->UnlockWriting();
