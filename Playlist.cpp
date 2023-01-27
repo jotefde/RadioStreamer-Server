@@ -73,4 +73,7 @@ Track* Playlist::GetByClient(Client* client)
 		if (sendBy->GetFD() == client->GetFD())
 			return track;
 	}
+	sendBy = nullptr;
+	delete sendBy;
+	return nullptr;
 }

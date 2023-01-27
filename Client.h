@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include "Utils.h"
 #include <thread>
+#include <mutex>
 
 using namespace std;
 
@@ -15,18 +16,27 @@ private:
 	Command _command;
 	bool _isListeningStream;
 	SyncStatus _syncStatus;
+	bool _doTerminate = false;
+	mutex _writeMutex;
+	mutex _readMutex;
+	mutex _busyMutex;
 
 public:
-	std::thread ClientThread;
+	std::thread ListenerThread;
+	std::thread NotifierThread;
 	Client(int fd);
-	void Listener();
 	int GetFD();
 	void SetCommand(Command cmd);
-	Command GetCommand();
 	void Disconnect();
 	void Play();
+	Command GetCommand();
 	void Stop();
 	bool JoinedStream();
 	void ScheduleSync(SyncStatus type = SyncStatus::STANDARD);
 	SyncStatus GetSyncStatus();
+	bool IsAlive();
+	void LockWriting();
+	void UnlockWriting();
+	void LockReading();
+	void UnlockReading();
 };

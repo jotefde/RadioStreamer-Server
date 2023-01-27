@@ -57,13 +57,10 @@ Server::Server(long port)
         perror("bind failed");
         return;
     }
-    _isReady = true;
 }
 
 void Server::Run()
 {
-    fd_set readfds, writefds;
-
 	struct sockaddr_in address;
 	int addrlen = 0;
 	int new_socket;
@@ -73,138 +70,124 @@ void Server::Run()
         return;
     }
 
-	emitInter(true);
+	_emiterThread = thread(&Server::AudioEmiter, this);
+
     while (true)
     {
-		//clear the socket set
-		FD_ZERO(&readfds);
-		FD_ZERO(&writefds);
-
-		//add master socket to set
-		FD_SET(_FD, &readfds);
-		FD_SET(_FD, &writefds);
-		int max_sd = _FD;
-
-		//add child sockets to set
-		for (Client* client : _clients)
+		addrlen = sizeof(address);
+		if ((new_socket = accept(_FD, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0)
 		{
-			//if valid socket descriptor then add to read list
-			if (client > 0)
-			{
-				FD_SET(client->GetFD(), &readfds);
-				FD_SET(client->GetFD(), &writefds);
-			}
-
-			//highest file descriptor number, need it for the select function
-			if (client->GetFD() > max_sd)
-				max_sd = client->GetFD();
+			perror("accept");
+			exit(EXIT_FAILURE);
 		}
 
-		//wait for an activity on one of the sockets , timeout is NULL ,
-		//so wait indefinitely
-		int activity = select(max_sd + 1, &readfds, &writefds, NULL, NULL);
-
-		if ((activity < 0) && (errno != EINTR))
-		{
-			printf("select error");
-		}
-
-		//If something happened on the master socket ,
-		//then its an incoming connection
-		if (FD_ISSET(_FD, &readfds))
-		{
-			addrlen = sizeof(address);
-			if ((new_socket = accept(_FD, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0)
-			{
-				perror("accept");
-				exit(EXIT_FAILURE);
-			}
-
-			//inform user of socket number - used in send and receive commands
-			string msg = "Client "+to_string(new_socket) + " connected (" + string(inet_ntoa(address.sin_addr)) + ":" + to_string(ntohs(address.sin_port)) + ")";
-			Utils::Print(msg);
-			Client* newClient = new Client(new_socket);
-			newClient->ClientThread = thread(&Client::Listener, newClient);
-			//add new socket to array of sockets
-			_clients.push_back(newClient);
-		}
-
-		//else its some IO operation on some other socket
-		vector<char> audioPackage;
-		if (_clients.size() > 0 && emitInter())
-		{
-			if (_trackBuffer.size() < _packageSize)
-			{
-				audioPackage = vector<char>(_trackBuffer.begin(), _trackBuffer.begin() + _trackBuffer.size());
-				if (!_waitingQueue->IsEmpty())
-				{
-					NextTrack();
-					scheduleSyncInfo();
-				}
-				/*
-				* TODO:
-				*	- Send new Track info to clients
-				*/
-			}
-			else
-			{
-				copy(_trackBuffer.begin(), _trackBuffer.begin() + _packageSize, back_inserter(audioPackage));
-				//audioPackage = vector<char>(_trackBuffer.begin(), _trackBuffer.begin() + _packageSize);
-				_trackBuffer = vector<char>(_trackBuffer.begin() + _packageSize, _trackBuffer.end());
-			}
-		}
-
-		if (audioPackage.size() > 0)
-		{
-			//printf("Emiting %d: %d\n", _currentTrack == NULL, audioPackage.size());
-			//if (!_uploadQueue->IsEmpty())
-			//	printf("%d\n", _uploadQueue->Current()->Data.size());
-		}
-
-		for (int clientIndex = 0; clientIndex < _clients.size(); clientIndex++)
-		{
-			Client* client = _clients[clientIndex];
-			if (client == nullptr)
-				continue;
-
-			if (FD_ISSET(client->GetFD(), &readfds))
-			{
-				//Check if it was for closing , and also read the
-				//incoming message
-				receiveMessage(client);
-			}
-			
-			// broadcasting buffered chunk of current track
-			// emission speed <= _packageSize / _emissionInterruptDuration
-			if (emitInter())
-			{
-				if(_currentTrack != NULL)
-				{
-					if (client->JoinedStream() && FD_ISSET(client->GetFD(), &writefds))
-					{
-						emitAudio(client, audioPackage);
-						SyncStatus status;
-						if ((status = client->GetSyncStatus()) != SyncStatus::IDLE)
-						{
-							sendTrackInfo(client);
-						}
-					}
-				}
-				emitInter(true);
-			}
-		}
+		_clientsMutex.lock();
+		Client* newClient = new Client(new_socket);
+		newClient->ListenerThread = thread(&Server::ClientListener, this, newClient);
+		newClient->NotifierThread = thread(&Server::ClientNotifier, this, newClient);
+		//add new socket to array of sockets
+		_clients.push_back(newClient);
+		_clientsMutex.unlock();
+		string msg = "Client "+to_string(new_socket) + " connected (" + string(inet_ntoa(address.sin_addr)) + ":" + to_string(ntohs(address.sin_port)) + ")";
+		Utils::Print(msg);
     }
 
 	for (auto& client : _clients)
 	{
-		shutdown(client->GetFD(), SHUT_RDWR);
-		close(client->GetFD());
+		client->Disconnect();
 	}
 	close(_FD);
 }
 
+void Server::ClientListener(Client* client)
+{
+	while (client != NULL && client->IsAlive())
+	{
+		client->LockReading();
+		receiveMessage(client);
+		client->UnlockReading();
+	}
+	removeClient(client);
+	terminate();
+}
+
+void Server::ClientNotifier(Client* client)
+{
+	while (client != NULL && client->IsAlive())
+	{
+		if (client->GetSyncStatus() != SyncStatus::IDLE)
+		{
+			sendTrackInfo(client);
+		}
+	}
+	terminate();
+}
+
+void Server::AudioEmiter()
+{
+	Client* client;
+	vector<char> audioPackage(_packageSize);
+	int sentBytes = 0;
+
+	while (true)
+	{
+		// broadcasting buffered chunk of current track
+		// emission speed <= _packageSize / _emissionInterruptDuration
+		if (interruptEmission() || _clients.empty())
+			continue;
+
+		audioPackage.clear();
+		// if it's the last package of current track
+		if (_trackBuffer.size() < _packageSize)
+		{
+			_currentTrackMutex.lock();
+			audioPackage = vector<char>(_trackBuffer.begin(), _trackBuffer.begin() + _trackBuffer.size());
+			_currentTrackMutex.unlock();
+			if (!_waitingQueue->IsEmpty())
+			{
+				NextTrack();
+				scheduleSyncInfo();
+			}
+			/*
+			* TODO:
+			*	- Send new Track info to clients
+			*/
+		}
+		else
+		{
+			_currentTrackMutex.lock();
+			copy(_trackBuffer.begin(), _trackBuffer.begin() + _packageSize, back_inserter(audioPackage));
+			//audioPackage = vector<char>(_trackBuffer.begin(), _trackBuffer.begin() + _packageSize);
+			_trackBuffer = vector<char>(_trackBuffer.begin() + _packageSize, _trackBuffer.end());
+			_currentTrackMutex.unlock();
+		}
+
+		for (int clientIndex = 0; clientIndex < _clients.size(); clientIndex++)
+		{
+			client = _clients[clientIndex];
+			if (client == NULL || _currentTrack == NULL)
+				continue;
+
+			if (client->JoinedStream())
+			{
+				sentBytes = 0;
+				client->LockWriting();
+				while (!audioPackage.empty())
+				{
+					sentBytes = send(client->GetFD(), &audioPackage[0], 1024, 0);
+					if (sentBytes > 0)
+						audioPackage.erase(audioPackage.begin(), audioPackage.begin() + sentBytes);
+					//usleep(100);
+				}
+				client->UnlockWriting();
+			}
+		}
+	}
+}
+
 void Server::NextTrack()
 {
+	_currentTrackMutex.lock();
 	if(_currentTrack != NULL)
 		_playedQueue->PushBack(_currentTrack);
 	_currentTrack = _waitingQueue->PopFront();
@@ -214,11 +197,13 @@ void Server::NextTrack()
 		return;
 	}
 	_trackBuffer = _currentTrack->LoadData();
+	_currentTrackMutex.unlock();
 	Utils::Print("Streaming started: '" + _currentTrack->GetTitle() + "'");
 }
 
 void Server::PrevTrack()
 {
+	_currentTrackMutex.lock();
 	if(_currentTrack != NULL)
 		_waitingQueue->PushFront(_currentTrack);
 	_currentTrack = _playedQueue->PopBack();
@@ -228,38 +213,30 @@ void Server::PrevTrack()
 		return;
 	}
 	_trackBuffer = _currentTrack->LoadData();
+	_currentTrackMutex.unlock();
 	Utils::Print("Streaming started: '" + _currentTrack->GetTitle() + "'");
 }
 
 void Server::scheduleSyncInfo(bool force)
 {
-	SyncStatus newStatus = SyncStatus::STANDARD;
-	if (force)
-		newStatus = SyncStatus::FORCE;
+	SyncStatus newStatus = force ? SyncStatus::FORCE : SyncStatus::STANDARD;
+	Client* client;
 	for (int clientIndex = 0; clientIndex < _clients.size(); clientIndex++)
 	{
-		Client* client = _clients[clientIndex];
+		client = _clients[clientIndex];
 		if (client != NULL)
 			client->ScheduleSync(newStatus);
 	}
-}
-
-void Server::RemoveClient(Client* client)
-{
-	_clients.erase(std::remove(_clients.begin(), _clients.end(), client), _clients.end());
+	client = nullptr;
 	delete client;
 }
 
-void Server::emitAudio(Client* client, vector<char> audioPackage)
+void Server::removeClient(Client* client)
 {
-	int sentBytes = 0;
-	while (!audioPackage.empty())
-	{
-		sentBytes = send(client->GetFD(), &audioPackage[0], 1024, 0);
-		if (sentBytes > 0)
-			audioPackage.erase(audioPackage.begin(), audioPackage.begin() + sentBytes);
-		//usleep(100);
-	}
+	_clientsMutex.lock();
+	_clients.erase(std::remove(_clients.begin(), _clients.end(), client), _clients.end());
+	delete client;
+	_clientsMutex.unlock();
 }
 
 void Server::sendTrackInfo(Client* client)
@@ -270,7 +247,9 @@ void Server::sendTrackInfo(Client* client)
 		cmd = Command::INFO_SYNC;
 		vector<char> bytes = vector<char>(4);
 		memcpy(&bytes[0], &cmd, 4);
+		client->LockWriting();
 		send(client->GetFD(), &bytes[0], bytes.size(), 0);
+		client->UnlockWriting();
 		printf("SENT SYNC INFO\n");
 		client->ScheduleSync(SyncStatus::STANDARD);
 		return;
@@ -283,7 +262,10 @@ void Server::sendTrackInfo(Client* client)
 	memcpy(&bytes[0], &cmd, 4);
 	memcpy(&bytes[0] + 4, str.data(), str.length());
 		//vector<char>(str[0], str.length());
-	int sentBytes = send(client->GetFD(), &bytes[0], bytes.size(), 0);
+
+	client->LockWriting();
+	send(client->GetFD(), &bytes[0], bytes.size(), 0);
+	client->UnlockWriting();
 	client->ScheduleSync(SyncStatus::IDLE);
 	printf("SENT TRACK INFO\n");
 }
@@ -296,59 +278,58 @@ void Server::receiveMessage(Client* client)
 	if (lastCmd == Command::TRANSFER)
 		buffSize = 1024 * 10;
 	char buff[buffSize];
-	if ((readCount = read(client->GetFD(), buff, buffSize)) == 0)
+	readCount = read(client->GetFD(), buff, buffSize);
+	if (readCount == 0)
 	{
 		client->Disconnect();
-		RemoveClient(client);
+		return;
 	}
-	else
+
+	buff[readCount] = '\0';
+	Message message = Utils::ParseMessage(buff, readCount);
+
+	if (lastCmd == Command::TRANSFER && message.command != Command::END_UPLOAD)
+		message.command = Command::TRANSFER;
+
+	if (message.command == Command::NONE)
+		return;
+
+	switch (message.command)
 	{
-		buff[readCount] = '\0';
-		Message message = Utils::ParseMessage(buff, readCount);
-
-		if (lastCmd == Command::TRANSFER && message.command != Command::END_UPLOAD)
-			message.command = Command::TRANSFER;
-
-		if (message.command == Command::NONE)
-			return;
-
-		switch (message.command)
-		{
-			case Command::PLAY:
-				client->Play();
-				client->ScheduleSync(SyncStatus::STANDARD);
-				break;
-			case Command::STOP:
-				client->Stop();
-				break;
-			case Command::BEGIN_UPLOAD:
-				beginUpload(client, message.values);
-				break;
-			case Command::TRANSFER:
-				receiveTransfer(client, buff, readCount);
-				break;
-			case Command::END_UPLOAD:
-				endUpload(client);
-				break;
-			case Command::NEXT:
-				client->SetCommand(Command::NEXT);
-				NextTrack();
-				scheduleSyncInfo(true);
-				break;
-			case Command::PREVIOUS:
-				client->SetCommand(Command::PREVIOUS);
-				PrevTrack();
-				scheduleSyncInfo(true);
-				break;
-		}
+		case Command::PLAY:
+			client->Play();
+			client->ScheduleSync(SyncStatus::STANDARD);
+			break;
+		case Command::STOP:
+			client->Stop();
+			break;
+		case Command::BEGIN_UPLOAD:
+			beginUpload(client, message.values);
+			break;
+		case Command::TRANSFER:
+			receiveTransfer(client, buff, readCount);
+			break;
+		case Command::END_UPLOAD:
+			endUpload(client);
+			break;
+		case Command::NEXT:
+			client->SetCommand(Command::NEXT);
+			NextTrack();
+			scheduleSyncInfo(true);
+			break;
+		case Command::PREVIOUS:
+			client->SetCommand(Command::PREVIOUS);
+			PrevTrack();
+			scheduleSyncInfo(true);
+			break;
 	}
 }
 
-bool Server::emitInter(bool set)
+bool Server::interruptEmission(bool set)
 { 
 	if(set)
 		_lastEmitTime = time(NULL);
-	return _lastEmitTime + _emissionInterruptDuration < time(NULL);
+	return _lastEmitTime + _emissionInterruptDuration > time(NULL);
 }
 
 void Server::beginUpload(Client* client, map<string, string> values)
@@ -356,7 +337,7 @@ void Server::beginUpload(Client* client, map<string, string> values)
 	Command cmd = client->GetCommand();
 	if (cmd == Command::BEGIN_UPLOAD || cmd == Command::TRANSFER)
 	{
-		Utils::Print("Uploading aborted. Already in progress...");
+		Utils::Print("Uploading is already in progress...");
 		return;
 	}
 	if (values.size() != 4)
@@ -371,7 +352,11 @@ void Server::beginUpload(Client* client, map<string, string> values)
 	int duration = stoi(values["Duration"]);
 	Track* track = new Track(title, name, duration, client);
 	track->Data = vector<char>();
+
+	_isBusy.lock();
 	_uploadQueue->PushBack(track);
+	_isBusy.unlock();
+
 	stringstream msg;
 	msg << "Client " << client->GetFD() << " started uploading '" << track->GetFileName() << "' (" << size / 1000.0 << " kB)";
 	Utils::Print(msg.str());
@@ -398,15 +383,13 @@ void Server::endUpload(Client* client)
 	trackFile.write(track->Data.data(), track->Data.size());
 	trackFile.close();
 	track->Data.clear();
+
+	_isBusy.lock();
 	_waitingQueue->PushBack(track);
 	_uploadQueue->Remove(track);
+	_isBusy.unlock();
 
 	stringstream msg;
 	msg << "Client " << client->GetFD() << " uploaded '" << track->GetFileName() << "' successfully";
 	Utils::Print(msg.str());
-}
-
-void Server::syncTrackInfo()
-{
-
 }

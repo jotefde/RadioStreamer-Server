@@ -7,17 +7,14 @@ int Client::GetFD()
 
 void Client::SetCommand(Command cmd)
 {
+	_busyMutex.lock();
 	_command = cmd;
+	_busyMutex.unlock();
 }
 
 Command Client::GetCommand()
 {
 	return _command;
-}
-
-void Client::Listener()
-{
-	Utils::Print(to_string(_FD) + "\n");
 }
 
 void Client::Disconnect()
@@ -32,6 +29,7 @@ void Client::Disconnect()
 	//Close the socket and mark as 0 in list for reuse
 	shutdown(_FD, SHUT_RDWR);
 	close(_FD);
+	_doTerminate = true;
 }
 
 void Client::Play()
@@ -44,7 +42,9 @@ void Client::Play()
 void Client::Stop()
 {
 	SetCommand(Command::STOP);
+	_busyMutex.lock();
 	_isListeningStream = false;
+	_busyMutex.unlock();
 	Utils::Print("Client " + to_string(_FD) + " left the stream");
 }
 
@@ -55,12 +55,39 @@ bool Client::JoinedStream()
 
 void Client::ScheduleSync(SyncStatus type)
 {
+	_busyMutex.lock();
 	_syncStatus = type;
+	_busyMutex.unlock();
 }
 
 SyncStatus Client::GetSyncStatus()
 {
 	return _syncStatus;
+}
+
+bool Client::IsAlive()
+{
+	return !_doTerminate;
+}
+
+void Client::LockWriting()
+{
+	_writeMutex.lock();
+}
+
+void Client::UnlockWriting()
+{
+	_writeMutex.unlock();
+}
+
+void Client::LockReading()
+{
+	_readMutex.lock();
+}
+
+void Client::UnlockReading()
+{
+	_readMutex.unlock();
 }
 
 Client::Client(int fd)
