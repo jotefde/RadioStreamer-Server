@@ -2,6 +2,8 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <sys/time.h>
 #include <ctime>
 #include <cstring>
 #include <unistd.h>
@@ -33,23 +35,26 @@ private:
 	mutex _isBusy;
 	thread _emiterThread;
 	vector<char> _trackBuffer;
-	int _packageSize = 1024 * 512;
+	int _packageSize = 1024 * 750; // 700 kB
 	Playlist* _waitingQueue;
 	Playlist* _playedQueue;
 	Playlist* _uploadQueue;
 	Track* _currentTrack = NULL;
-	unsigned long int _lastEmitTime;
-	int _emissionInterruptDuration = 1; // 1 sec
+	long int _lastEmitTime;
+	int _emissionInterruptDuration = 2000; // 300ms
+	int _currentTrackSentBytes = 0;
+	int _isRequestedNextTrack = false;
 
 	Client* findClient(int);
 	void receiveMessage(Client*);
-	bool interruptEmission(bool set = true);
+	bool interruptEmission(bool set = false);
 	void beginUpload(Client*, map<string, string>);
 	void receiveTransfer(Client*, char*, int);
 	void endUpload(Client*);
 	void sendTrackInfo(Client*);
 	void scheduleSyncInfo(bool force = false);
 	void removeClient(Client*);
+	int calculatePackageSize(int, int);
 
 public:
 	Server(long);

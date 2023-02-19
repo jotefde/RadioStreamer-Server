@@ -1,5 +1,7 @@
 #include "Server.h"
 
+const int BUFF_SIZE = 1024*2;
+
 vector<Client*> Server::_clients = vector<Client*>();
 
 Client* Server::findClient(int fd)
@@ -120,7 +122,6 @@ void Server::ClientNotifier(Client* client)
 			sendTrackInfo(client);
 		}
 	}
-	terminate();
 }
 
 void Server::AudioEmiter()
@@ -130,38 +131,22 @@ void Server::AudioEmiter()
 	vector<char> buffer(_packageSize);
 	int sentBytes = 0;
 
+	interruptEmission(true);
 	while (true)
 	{
 		// broadcasting buffered chunk of current track
 		// emission speed <= _packageSize / _emissionInterruptDuration
-		if (interruptEmission() || _clients.empty())
+		if (interruptEmission() || _clients.empty() || _trackBuffer.size() == 0)
 			continue;
 
 		audioPackage.clear();
-		// if it's the last package of current track
-		if (_trackBuffer.size() < _packageSize)
-		{
-			_currentTrackMutex.lock();
-			audioPackage = vector<char>(_trackBuffer.begin(), _trackBuffer.begin() + _trackBuffer.size());
-			_currentTrackMutex.unlock();
-			if (!_waitingQueue->IsEmpty())
-			{
-				NextTrack();
-				scheduleSyncInfo();
-			}
-			/*
-			* TODO:
-			*	- Send new Track info to clients
-			*/
-		}
-		else
-		{
-			_currentTrackMutex.lock();
-			copy(_trackBuffer.begin(), _trackBuffer.begin() + _packageSize, back_inserter(audioPackage));
-			//audioPackage = vector<char>(_trackBuffer.begin(), _trackBuffer.begin() + _packageSize);
-			_trackBuffer = vector<char>(_trackBuffer.begin() + _packageSize, _trackBuffer.end());
-			_currentTrackMutex.unlock();
-		}
+		_currentTrackMutex.lock();
+		int bytesToSend = _trackBuffer.size() >= _packageSize ? _packageSize : _trackBuffer.size();
+		copy(_trackBuffer.begin(), _trackBuffer.begin() + bytesToSend, back_inserter(audioPackage));
+		_trackBuffer = vector<char>(_trackBuffer.begin() + bytesToSend, _trackBuffer.end());
+		_currentTrackMutex.unlock();
+
+		_currentTrackSentBytes += _packageSize;
 
 		for (int clientIndex = 0; clientIndex < _clients.size(); clientIndex++)
 		{
@@ -176,7 +161,9 @@ void Server::AudioEmiter()
 				client->LockWriting();
 				while (!buffer.empty())
 				{
-					sentBytes = send(client->GetFD(), &buffer[0], 1024, 0);
+					sentBytes = send(client->GetFD(), &buffer[0], BUFF_SIZE, 0);
+					/*if (buffer.size() < BUFF_SIZE)
+						sentBytes = buffer.size();*/
 					if (sentBytes > 0)
 						buffer.erase(buffer.begin(), buffer.begin() + sentBytes);
 					//usleep(100);
@@ -184,7 +171,15 @@ void Server::AudioEmiter()
 				client->UnlockWriting();
 			}
 		}
+		interruptEmission(true);
 	}
+}
+
+int Server::calculatePackageSize(int trackDuration, int trackSize)
+{
+	float timeRatio = ((float)(_emissionInterruptDuration / 1000.0f) + 0.3) / (float)trackDuration;
+	int roundedKiloBytes = trackSize * timeRatio / BUFF_SIZE;
+	return roundedKiloBytes * BUFF_SIZE;
 }
 
 void Server::NextTrack()
@@ -193,12 +188,14 @@ void Server::NextTrack()
 	if(_currentTrack != NULL)
 		_playedQueue->PushBack(_currentTrack);
 	_currentTrack = _waitingQueue->PopFront();
+	_currentTrackSentBytes = 0;
 	if (_currentTrack == NULL)
 	{
 		_trackBuffer = vector<char>();
 		return;
 	}
 	_trackBuffer = _currentTrack->LoadData();
+	_packageSize = calculatePackageSize(_currentTrack->GetDuration(), _currentTrack->GetFileSize());
 	_currentTrackMutex.unlock();
 	Utils::Print("Streaming started: '" + _currentTrack->GetTitle() + "'");
 }
@@ -209,12 +206,14 @@ void Server::PrevTrack()
 	if(_currentTrack != NULL)
 		_waitingQueue->PushFront(_currentTrack);
 	_currentTrack = _playedQueue->PopBack();
+	_currentTrackSentBytes = 0;
 	if (_currentTrack == NULL)
 	{
 		_trackBuffer = vector<char>();
 		return;
 	}
 	_trackBuffer = _currentTrack->LoadData();
+	_packageSize = calculatePackageSize(_currentTrack->GetDuration(), _currentTrack->GetFileSize());
 	_currentTrackMutex.unlock();
 	Utils::Print("Streaming started: '" + _currentTrack->GetTitle() + "'");
 }
@@ -237,7 +236,6 @@ void Server::removeClient(Client* client)
 {
 	_clientsMutex.lock();
 	_clients.erase(std::remove(_clients.begin(), _clients.end(), client), _clients.end());
-	delete client;
 	_clientsMutex.unlock();
 }
 
@@ -257,12 +255,15 @@ void Server::sendTrackInfo(Client* client)
 		return;
 	}
 	stringstream ss;
-	ss << "Title=" << _currentTrack->GetTitle() << ";Duration=" << _currentTrack->GetDuration() << ";Index=0;Time=0";
+	int currTime = _currentTrack->GetDuration() * ((double)_currentTrackSentBytes / (double)_currentTrack->GetFileSize());
+	Utils::Print(to_string(currTime));
+	ss << "Title=" << _currentTrack->GetTitle() << ";Duration=" << _currentTrack->GetDuration() << ";Index=0;Time="<< currTime <<";Length=" << _currentTrack->GetFileSize();
 	string str = ss.str();
 	cmd = Command::INFO_CURRENT_TRACK;
-	vector<char> bytes = vector<char>(str.length() + 4);
+	vector<char> bytes = vector<char>(BUFF_SIZE);
 	memcpy(&bytes[0], &cmd, 4);
 	memcpy(&bytes[0] + 4, str.data(), str.length());
+	//memcpy(&bytes[0] + 4 + str.length(), &cmd, 4);
 		//vector<char>(str[0], str.length());
 
 	client->LockWriting();
@@ -275,10 +276,10 @@ void Server::sendTrackInfo(Client* client)
 void Server::receiveMessage(Client* client)
 {
 	int readCount = 0;
-	int buffSize = 1024 + 1;
+	int buffSize = BUFF_SIZE + 1;
 	Command lastCmd = client->GetCommand();
 	if (lastCmd == Command::TRANSFER)
-		buffSize = 1024 * 10;
+		buffSize = 5*BUFF_SIZE;
 	char buff[buffSize];
 	readCount = read(client->GetFD(), buff, buffSize);
 	if (readCount == 0)
@@ -288,6 +289,8 @@ void Server::receiveMessage(Client* client)
 	}
 
 	buff[readCount] = '\0';
+	if (readCount == 0)
+		return;
 	Message message = Utils::ParseMessage(buff, readCount);
 
 	if (lastCmd == Command::TRANSFER && message.command != Command::END_UPLOAD)
@@ -299,6 +302,11 @@ void Server::receiveMessage(Client* client)
 	switch (message.command)
 	{
 		case Command::PLAY:
+			if (_trackBuffer.size() == 0 && _clients.size() == 1)
+			{
+				NextTrack();
+				Utils::Print("GSDGDFSGFD");
+			}
 			client->Play();
 			client->ScheduleSync(SyncStatus::STANDARD);
 			break;
@@ -324,14 +332,25 @@ void Server::receiveMessage(Client* client)
 			PrevTrack();
 			scheduleSyncInfo(true);
 			break;
+		case Command::REQUEST_NEXT_TRACK:
+			if (!_waitingQueue->IsEmpty() && _isRequestedNextTrack == false)
+			{
+				_isRequestedNextTrack = true;
+				NextTrack();
+				scheduleSyncInfo();
+			}
+			_isRequestedNextTrack = false;
+			break;
 	}
 }
 
 bool Server::interruptEmission(bool set)
-{ 
-	if(set)
-		_lastEmitTime = time(NULL);
-	return _lastEmitTime + _emissionInterruptDuration > time(NULL);
+{
+	long int tempUsec = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now().time_since_epoch()).count();
+	if (set)
+		_lastEmitTime = tempUsec;
+	int div = tempUsec - _lastEmitTime;
+	return _lastEmitTime + _emissionInterruptDuration > tempUsec;
 }
 
 void Server::beginUpload(Client* client, map<string, string> values)
